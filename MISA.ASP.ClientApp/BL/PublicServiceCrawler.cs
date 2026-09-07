@@ -11,6 +11,7 @@ using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Configuration;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -608,9 +609,18 @@ namespace MISA.ASP.ClientApp.BL
                                     SubmitTimes = submitTimesText,
                                     TaxAgencyCode = taxAgencyCodeText,
                                     TaxAgencyName = taxAgencyNameText,
-                                    SubmitDate = submitDateText,
                                     State = stateText
                                 };
+
+                                if (DateTime.TryParseExact(
+                                    submitDateText,
+                                    "dd/MM/yyyy HH:mm",
+                                    CultureInfo.InvariantCulture,
+                                    DateTimeStyles.None,
+                                    out DateTime dateValue))
+                                {
+                                    iTaxDec.SubmitDate = dateValue.ToString("dd/MM/yyyy HH:mm:ss");
+                                }
 
                                 if (!string.IsNullOrWhiteSpace(iTaxDec.Order) && iTaxDec.Order.Contains("."))
                                 {
@@ -905,8 +915,17 @@ namespace MISA.ASP.ClientApp.BL
                                 {
                                     NotificationID = idTbao,
                                     Name = title,
-                                    SendDate = sendDate
                                 };
+
+                                if (DateTime.TryParseExact(
+                                    sendDate,
+                                    "HH:mm dd/MM/yyyy",
+                                    CultureInfo.InvariantCulture,
+                                    DateTimeStyles.None,
+                                    out DateTime dateValue))
+                                {
+                                    iNoti.SendDate = dateValue.ToString("dd/MM/yyyy HH:mm:ss");
+                                }
 
                                 await Step17_DownloadNotificationFile(iTaxDec, iNoti);
                                 lstTaxDecNotification.Add(iNoti);
@@ -976,6 +995,91 @@ namespace MISA.ASP.ClientApp.BL
                     File.WriteAllBytes(filePath, fileBytes);
                     LogUtil.LogTrace($"PublicServiceCrawler.Step17_DownloadNotificationFile.SaveFile: {filePath}");
                 }
+
+                var xmlFiles = Directory.GetFiles(folderPath, "*.xml", SearchOption.AllDirectories);
+
+                foreach ( var xmlFile in xmlFiles)
+                {
+                    if (xmlFile.Contains("Thong bao_") && Path.GetExtension(iTaxDecNoti.FileName) == ".xml")
+                    {
+                        LogUtil.LogTrace("Step17_DownloadNotificationFile.ExtractXml");
+                        // Đọc file để trích xuất 1 số thông tin như: Mã thông báo, Trạng thái chấp thuận, ...
+                        XmlDocument xmlDoc = new XmlDocument();
+                        xmlDoc.Load(xmlFile);
+                        LogUtil.LogTrace("Step17_DownloadNotificationFile.LoadDoc");
+                        XmlNamespaceManager ns = new XmlNamespaceManager(xmlDoc.NameTable);
+                        ns.AddNamespace("msbld", "http://kekhaithue.gdt.gov.vn/TBaoThue");
+
+                        var notiCode = xmlDoc.SelectSingleNode("//msbld:maTBao", ns).InnerText;
+                        LogUtil.LogTrace("Step17_DownloadNotificationFile.notiCode");
+                        iTaxDecNoti.Code = notiCode;
+                        iTaxDecNoti.XMLTrangThai = xmlDoc.SelectSingleNode("//msbld:trangThai", ns).InnerText;
+                        iTaxDecNoti.XMLTenTBao = xmlDoc.SelectSingleNode("//msbld:tenTBao", ns).InnerText;
+                        LogUtil.LogTrace("Step17_DownloadNotificationFile.XMLTrangThai");
+                    }
+                }
+
+                //foreach (var xmlFile in xmlFiles)
+                //{
+                //    try
+                //    {
+                //        LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.Start: {xmlFile}");
+                //        XmlDocument xmlDoc = new XmlDocument();
+                //        xmlDoc.Load(xmlFile);
+
+                //        XmlNamespaceManager ns = new XmlNamespaceManager(xmlDoc.NameTable);
+                //        ns.AddNamespace("msbld", "http://kekhaithue.gdt.gov.vn/TKhaiThue");
+
+                //        LogUtil.LogTrace("PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.taxDecCode");
+                //        var taxDecCodeNode = xmlDoc.SelectSingleNode("//msbld:maTKhai", ns);
+                //        if (taxDecCodeNode != null)
+                //        {
+                //            var taxDecCode = taxDecCodeNode.InnerText;
+                //            iTaxDec.Code = taxDecCode;
+                //            switch (taxDecCode)
+                //            {
+                //                case "01":
+                //                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct40", ns)?.InnerText;
+                //                    iTaxDec.CreditAmount = xmlDoc.SelectSingleNode("//msbld:ct43", ns)?.InnerText;
+                //                    break;
+                //                case "03":
+                //                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ctG", ns)?.InnerText;
+                //                    break;
+                //                case "394":
+                //                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct32", ns)?.InnerText;
+                //                    break;
+                //                case "395":
+                //                    break;
+                //                case "842":
+                //                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct40", ns)?.InnerText;
+                //                    iTaxDec.CreditAmount = xmlDoc.SelectSingleNode("//msbld:ct43", ns)?.InnerText;
+                //                    break;
+                //                case "864":
+                //                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct29", ns)?.InnerText;
+                //                    break;
+                //                case "892":
+                //                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ctI", ns)?.InnerText;
+                //                    break;
+                //                case "953":
+                //                    break;
+                //                default:
+                //                    break;
+                //            }
+                //        }
+
+                //        LogUtil.LogTrace("PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.TaxAgencyCode");
+                //        var taxAgencyCodeNode = xmlDoc.SelectSingleNode("//msbld:maCQTNoiNop", ns);
+                //        if (taxAgencyCodeNode != null)
+                //        {
+                //            iTaxDec.TaxAgencyCode = taxAgencyCodeNode.InnerText;
+                //        }
+                //        LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.End");
+                //    }
+                //    catch (Exception exXml)
+                //    {
+                //        LogUtil.LogError(exXml);
+                //    }
+                //}
 
                 LogUtil.LogTrace("PublicServiceCrawler.Step17_DownloadNotificationFile.End");
             }

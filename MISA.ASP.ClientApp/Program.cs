@@ -27,9 +27,9 @@ namespace MISA.ASP.ClientApp
 
             if (ConfigurationManager.AppSettings["Env"] == "Dev")
             {
-                var applicationPath = @"C:\Users\bvhau\source\repos\MISA.SME.ETax\MISA.ASP.ClientApp\bin\Debug\MISA.ASP.ClientApp.exe";
+                var applicationPath = @"F:\Project\ToolTaxDeclaration\MISA.ASP.ClientApp\bin\Debug\MISA.ASP.ClientApp.exe";
                 var KeyTest = Registry.CurrentUser.OpenSubKey("Software", true).OpenSubKey("Classes", true);
-                RegistryKey key = KeyTest.CreateSubKey("MisaASPLauncherDev");
+                RegistryKey key = KeyTest.CreateSubKey("MisaASPLauncher");
                 key.SetValue("URL Protocol", "MisaASPLauncherDev");
                 key.CreateSubKey(@"shell\open\command").SetValue("", "\"" + applicationPath + "\" \"%1\"");
             }
