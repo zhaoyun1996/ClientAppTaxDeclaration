@@ -47,7 +47,14 @@ namespace MISA.ASP.ClientApp.Utils.Logging
             if (responseMessage != null)
             {
                 MainLogger.Log(LogLevel.Error, JsonConvert.SerializeObject(responseMessage));
-                MainLogger.Log(LogLevel.Error, responseMessage.Content.ReadAsStringAsync().Result);
+                try
+                {
+                    MainLogger.Log(LogLevel.Error, responseMessage.Content.ReadAsStringAsync().Result);
+                }
+                catch
+                {
+                    MainLogger.Log(LogLevel.Error, "<<Response content not readable / already disposed>>");
+                }
             }
         }
 

@@ -2,8 +2,6 @@
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
-using System.Globalization;
-using System.Text;
 
 namespace MISA.ASP.ClientApp.Models.EtaxCrawler
 {
@@ -30,6 +28,9 @@ namespace MISA.ASP.ClientApp.Models.EtaxCrawler
         public string State { get; set; }
         [JsonConverter(typeof(BoolConverter))]
         public bool IsHideDownloadLink { get; set; }
+        [JsonConverter(typeof(BoolConverter))]
+        public bool HasDownloadError { get; set; }
+        public string DownloadErrorMsg { get; set; }
         [JsonConverter(typeof(BoolConverter))]
         public bool IsHideNotificationLink { get; set; }
         [JsonConverter(typeof(BoolConverter))]

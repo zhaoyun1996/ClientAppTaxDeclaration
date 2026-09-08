@@ -346,14 +346,17 @@ namespace MISA.ASP.ClientApp.BL
         /// </summary>
         public async Task SignIn()
         {
-            await Step1_GotoHomeLogin();
-            await Task.Delay(500, _stoppingToken);
-            await Step2_GotoLoginPage();
-            await Task.Delay(500, _stoppingToken);
-            var captcha = await Step3_ResolveCaptcha();
-            await Task.Delay(500, _stoppingToken);
-            await Step4_PostLoginLDAP(captcha);
-            await Task.Delay(1000, _stoppingToken);
+            await CommonPattern.Retry(async () =>
+            {
+                await Step1_GotoHomeLogin();
+                await Task.Delay(500, _stoppingToken);
+                await Step2_GotoLoginPage();
+                await Task.Delay(500, _stoppingToken);
+                var captcha = await Step3_ResolveCaptcha();
+                await Task.Delay(500, _stoppingToken);
+                await Step4_PostLoginLDAP(captcha);
+                await Task.Delay(1000, _stoppingToken);
+            }, 5);
         }
 
         #endregion
@@ -530,6 +533,12 @@ namespace MISA.ASP.ClientApp.BL
                 responseMessage.EnsureSuccessStatusCode();
 
                 var html = await responseMessage.Content.ReadAsStringAsync();
+
+                if (html.Contains("Mã xác nhận") && (html.Contains("không chính xác") || html.Contains("không đúng") || html.Contains("chưa đúng")))
+                {
+                    throw new InvalidCaptchaException();
+                }
+
                 HtmlDocument doc = new HtmlDocument();
                 doc.LoadHtml(html);
 
@@ -637,17 +646,7 @@ namespace MISA.ASP.ClientApp.BL
 
                                 if (!string.IsNullOrWhiteSpace(iTaxDec.TransactionID))
                                 {
-                                    string folderPath = $"{FileUtil.BASE_PATH}/OutputFiles/{_profileID}/{_customerID}/{iTaxDec.TransactionID}";
-                                    Directory.CreateDirectory(folderPath);
-
-                                    var detailDoc = await Step13_GetDetailPage(iTaxDec.TransactionID);
-                                    await Task.Delay(300, _stoppingToken);
-
-                                    await Step13_DownloadTransactionFile(iTaxDec);
-                                    await Task.Delay(300, _stoppingToken);
-
-                                    await Step14_GetThongBaoPageData(iTaxDec, detailDoc);
-                                    await Task.Delay(300, _stoppingToken);
+                                    await ProcessTransactionFile(iTaxDec);
                                 }
 
                                 lstTaxDecSubmitted.Add(iTaxDec);
@@ -655,7 +654,7 @@ namespace MISA.ASP.ClientApp.BL
                         }
                         catch (Exception ex)
                         {
-                            LogUtil.LogError(ex);
+                            LogUtil.LogError(ex, $"PublicServiceCrawler.ExtractTaxDecSubmitted.RowError, index: {i}");
                         }
                     }
                 }
@@ -713,15 +712,22 @@ namespace MISA.ASP.ClientApp.BL
 
         /// <summary>
         /// Bước 13: Đọc và tải file tờ khai dựa vào API /tthc/tchs/downloadhoso
+        /// Trả về true nếu tải và ghi file thành công (có ít nhất 1 file tờ khai), ngược lại false.
+        /// Không còn swallow lỗi: lỗi hợp lệ (XML/Zip sai) được đánh dấu và ghi log cảnh báo.
         /// </summary>
-        private async Task Step13_DownloadTransactionFile(TaxDeclarationSubmitted iTaxDec)
+        private async Task<bool> Step13_DownloadTransactionFile(TaxDeclarationSubmitted iTaxDec, string csrfToken = null)
         {
             HttpResponseMessage responseMessage = null;
+            var token = string.IsNullOrEmpty(csrfToken) ? _csrfToken : csrfToken;
+            bool hasDownloadedFile = false;
             try
             {
                 LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.Start, maHoSo: {iTaxDec.TransactionID}");
-                string folderPath = $"{FileUtil.BASE_PATH}/OutputFiles/{_profileID}/{_customerID}/{iTaxDec.TransactionID}";
-                Directory.CreateDirectory(folderPath);
+                string transactionFolder = $"{FileUtil.BASE_PATH}/OutputFiles/{_profileID}/{_customerID}/{iTaxDec.TransactionID}";
+                string declarationsFolder = Path.Combine(transactionFolder, "Declarations");
+                string documentsFolder = Path.Combine(transactionFolder, "Documents");
+                Directory.CreateDirectory(declarationsFolder);
+                Directory.CreateDirectory(documentsFolder);
 
                 var payload = JsonConvert.SerializeObject(new { maHoSo = iTaxDec.TransactionID });
                 var request = new HttpRequestMessage(HttpMethod.Post, "/tthc/tchs/downloadhoso")
@@ -730,9 +736,9 @@ namespace MISA.ASP.ClientApp.BL
                 };
 
                 request.Headers.Add("Referer", $"{PUBLIC_SERVICE_URL}/tthc/tchs/files/detail/{iTaxDec.TransactionID}?loai=");
-                if (!string.IsNullOrEmpty(_csrfToken))
+                if (!string.IsNullOrEmpty(token))
                 {
-                    request.Headers.Add("X-XSRF-TOKEN", _csrfToken);
+                    request.Headers.Add("X-XSRF-TOKEN", token);
                 }
 
                 responseMessage = await _client.SendAsync(request, _stoppingToken);
@@ -744,126 +750,153 @@ namespace MISA.ASP.ClientApp.BL
                 var contentBase64 = jsonObj["content"]?.ToString();
                 var fileName = jsonObj["fileName"]?.ToString();
 
-                if (!string.IsNullOrEmpty(contentBase64))
+                if (string.IsNullOrEmpty(contentBase64))
                 {
-                    byte[] fileBytes = Convert.FromBase64String(contentBase64);
+                    LogUtil.LogError($"PublicServiceCrawler.Step13_DownloadTransactionFile.EmptyContent, maHoSo: {iTaxDec.TransactionID}");
+                    return false;
+                }
 
-                    if (string.IsNullOrEmpty(fileName))
-                    {
-                        fileName = $"{iTaxDec.TransactionID}.zip";
-                    }
+                byte[] fileBytes = Convert.FromBase64String(contentBase64);
 
-                    if (Path.GetExtension(fileName).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+                if (Path.GetExtension(fileName).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    using (var stream = new MemoryStream(fileBytes))
+                    using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
                     {
-                        try
+                        foreach (var entry in archive.Entries)
                         {
-                            using (var stream = new MemoryStream(fileBytes))
-                            using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
+                            if (string.IsNullOrEmpty(entry.Name)) continue;
+                            string destFolder;
+                            if (entry.Name.EndsWith("_0.xml", StringComparison.OrdinalIgnoreCase))
                             {
-                                foreach (var entry in archive.Entries)
+                                destFolder = declarationsFolder;
+                                if (string.IsNullOrEmpty(iTaxDec.FileName))
                                 {
-                                    if (string.IsNullOrEmpty(entry.Name)) continue;
-                                    string destinationPath = Path.Combine(folderPath, entry.FullName);
-                                    string dirPath = Path.GetDirectoryName(destinationPath);
-                                    if (!string.IsNullOrEmpty(dirPath) && !Directory.Exists(dirPath))
-                                    {
-                                        Directory.CreateDirectory(dirPath);
-                                    }
-                                    using (var entryStream = entry.Open())
-                                    using (var fileStream = File.Create(destinationPath))
-                                    {
-                                        entryStream.CopyTo(fileStream);
-                                    }
-
-                                    if (string.IsNullOrEmpty(iTaxDec.FileName) || Path.GetExtension(entry.Name).Equals(".xml", StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        iTaxDec.FileName = entry.Name;
-                                    }
+                                    iTaxDec.FileName = entry.Name;
                                 }
                             }
-                        }
-                        catch (Exception exZip)
-                        {
-                            LogUtil.LogError(exZip);
-                        }
-                    }
-                    else
-                    {
-                        iTaxDec.FileName = fileName;
-                        string filePath = Path.Combine(folderPath, fileName);
-                        File.WriteAllBytes(filePath, fileBytes);
-                        LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.SaveFile: {filePath}");
-                    }
-
-                    var xmlFiles = Directory.GetFiles(folderPath, "*.xml", SearchOption.AllDirectories);
-                    foreach (var xmlFile in xmlFiles)
-                    {
-                        try
-                        {
-                            LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.Start: {xmlFile}");
-                            XmlDocument xmlDoc = new XmlDocument();
-                            xmlDoc.Load(xmlFile);
-
-                            XmlNamespaceManager ns = new XmlNamespaceManager(xmlDoc.NameTable);
-                            ns.AddNamespace("msbld", "http://kekhaithue.gdt.gov.vn/TKhaiThue");
-
-                            LogUtil.LogTrace("PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.taxDecCode");
-                            var taxDecCodeNode = xmlDoc.SelectSingleNode("//msbld:maTKhai", ns);
-                            if (taxDecCodeNode != null)
+                            else
                             {
-                                var taxDecCode = taxDecCodeNode.InnerText;
-                                iTaxDec.Code = taxDecCode;
-                                switch (taxDecCode)
-                                {
-                                    case "01":
-                                        iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct40", ns)?.InnerText;
-                                        iTaxDec.CreditAmount = xmlDoc.SelectSingleNode("//msbld:ct43", ns)?.InnerText;
-                                        break;
-                                    case "03":
-                                        iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ctG", ns)?.InnerText;
-                                        break;
-                                    case "394":
-                                        iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct32", ns)?.InnerText;
-                                        break;
-                                    case "395":
-                                        break;
-                                    case "842":
-                                        iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct40", ns)?.InnerText;
-                                        iTaxDec.CreditAmount = xmlDoc.SelectSingleNode("//msbld:ct43", ns)?.InnerText;
-                                        break;
-                                    case "864":
-                                        iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct29", ns)?.InnerText;
-                                        break;
-                                    case "892":
-                                        iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ctI", ns)?.InnerText;
-                                        break;
-                                    case "953":
-                                        break;
-                                    default:
-                                        break;
-                                }
+                                destFolder = documentsFolder;
                             }
-
-                            LogUtil.LogTrace("PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.TaxAgencyCode");
-                            var taxAgencyCodeNode = xmlDoc.SelectSingleNode("//msbld:maCQTNoiNop", ns);
-                            if (taxAgencyCodeNode != null)
+                            string destinationPath = Path.Combine(destFolder, entry.FullName);
+                            string dirPath = Path.GetDirectoryName(destinationPath);
+                            if (!string.IsNullOrEmpty(dirPath) && !Directory.Exists(dirPath))
                             {
-                                iTaxDec.TaxAgencyCode = taxAgencyCodeNode.InnerText;
+                                Directory.CreateDirectory(dirPath);
                             }
-                            LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.End");
-                        }
-                        catch (Exception exXml)
-                        {
-                            LogUtil.LogError(exXml);
+                            using (var entryStream = entry.Open())
+                            using (var fileStream = File.Create(destinationPath))
+                            {
+                                entryStream.CopyTo(fileStream);
+                            }
+                            if (entry.Name.EndsWith("_0.xml", StringComparison.OrdinalIgnoreCase))
+                            {
+                                hasDownloadedFile = true;
+                            }
                         }
                     }
                 }
+                else
+                {
+                    string destFolder = Path.GetExtension(fileName).Equals(".xml", StringComparison.OrdinalIgnoreCase) ? declarationsFolder : documentsFolder;
+                    iTaxDec.FileName = fileName;
+                    string filePath = Path.Combine(destFolder, fileName);
+                    File.WriteAllBytes(filePath, fileBytes);
+                    LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.SaveFile: {filePath}");
+                    if (Path.GetExtension(fileName).Equals(".xml", StringComparison.OrdinalIgnoreCase))
+                    {
+                        hasDownloadedFile = true;
+                    }
+                }
+
+                var mainXmlFile = Directory.GetFiles(declarationsFolder, "*_0.xml", SearchOption.AllDirectories).FirstOrDefault();
+                if (string.IsNullOrEmpty(mainXmlFile))
+                {
+                    mainXmlFile = Directory.GetFiles(declarationsFolder, "*.xml", SearchOption.AllDirectories).FirstOrDefault();
+                }
+
+                if (!string.IsNullOrEmpty(mainXmlFile))
+                {
+                    try
+                    {
+                        if (string.IsNullOrEmpty(iTaxDec.FileName))
+                        {
+                            iTaxDec.FileName = Path.GetFileName(mainXmlFile);
+                        }
+
+                        LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.Start: {mainXmlFile}");
+                        XmlDocument xmlDoc = new XmlDocument();
+                        xmlDoc.Load(mainXmlFile);
+
+                        XmlNamespaceManager ns = new XmlNamespaceManager(xmlDoc.NameTable);
+                        ns.AddNamespace("msbld", "http://kekhaithue.gdt.gov.vn/TKhaiThue");
+
+                        LogUtil.LogTrace("PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.taxDecCode");
+                        var taxDecCodeNode = xmlDoc.SelectSingleNode("//msbld:maTKhai", ns);
+                        if (taxDecCodeNode != null)
+                        {
+                            var taxDecCode = taxDecCodeNode.InnerText;
+                            iTaxDec.Code = taxDecCode;
+                            switch (taxDecCode)
+                            {
+                                case "01":
+                                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct40", ns)?.InnerText;
+                                    iTaxDec.CreditAmount = xmlDoc.SelectSingleNode("//msbld:ct43", ns)?.InnerText;
+                                    break;
+                                case "03":
+                                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ctG", ns)?.InnerText;
+                                    break;
+                                case "394":
+                                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct32", ns)?.InnerText;
+                                    break;
+                                case "395":
+                                    break;
+                                case "842":
+                                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct40", ns)?.InnerText;
+                                    iTaxDec.CreditAmount = xmlDoc.SelectSingleNode("//msbld:ct43", ns)?.InnerText;
+                                    break;
+                                case "864":
+                                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ct29", ns)?.InnerText;
+                                    break;
+                                case "892":
+                                    iTaxDec.DebitAmount = xmlDoc.SelectSingleNode("//msbld:ctI", ns)?.InnerText;
+                                    break;
+                                case "953":
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+
+                        LogUtil.LogTrace("PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.TaxAgencyCode");
+                        var taxAgencyCodeNode = xmlDoc.SelectSingleNode("//msbld:maCQTNoiNop", ns);
+                        if (taxAgencyCodeNode != null)
+                        {
+                            iTaxDec.TaxAgencyCode = taxAgencyCodeNode.InnerText;
+                        }
+                        LogUtil.LogTrace($"PublicServiceCrawler.Step13_DownloadTransactionFile.ExtractXml.End");
+                    }
+                    catch (Exception exXml)
+                    {
+                        LogUtil.LogError(exXml, $"PublicServiceCrawler.Step13_DownloadTransactionFile.ParseXmlFailed, maHoSo: {iTaxDec.TransactionID}, file: {mainXmlFile}");
+                        return false;
+                    }
+                }
+
+                if (!hasDownloadedFile)
+                {
+                    LogUtil.LogError($"PublicServiceCrawler.Step13_DownloadTransactionFile.NoXmlFile, maHoSo: {iTaxDec.TransactionID}");
+                    return false;
+                }
 
                 LogUtil.LogTrace("PublicServiceCrawler.Step13_DownloadTransactionFile.End");
+                return true;
             }
             catch (Exception ex)
             {
                 LogUtil.LogError(ex, responseMessage);
+                return false;
             }
         }
 
@@ -927,7 +960,23 @@ namespace MISA.ASP.ClientApp.BL
                                     iNoti.SendDate = dateValue.ToString("dd/MM/yyyy HH:mm:ss");
                                 }
 
-                                await Step17_DownloadNotificationFile(iTaxDec, iNoti);
+                                bool notiOk = false;
+                                await CommonPattern.Retry(async () =>
+                                {
+                                    notiOk = await Step17_DownloadNotificationFile(iTaxDec, iNoti, _csrfToken);
+                                    if (!notiOk)
+                                    {
+                                        throw new Exception("Download notification file failed");
+                                    }
+                                    await Task.Delay(300, _stoppingToken);
+                                }, 3, 2000);
+                                if (!notiOk)
+                                {
+                                    iTaxDec.HasDownloadError = true;
+                                    iTaxDec.DownloadErrorMsg = $"Tải thông báo {idTbao} thất bại sau nhiều lần thử";
+                                    LogUtil.LogError($"PublicServiceCrawler.Step14_GetThongBaoPageData.DownloadFail, idTbao: {idTbao}");
+                                }
+
                                 lstTaxDecNotification.Add(iNoti);
                             }
                         }
@@ -944,16 +993,77 @@ namespace MISA.ASP.ClientApp.BL
         }
 
         /// <summary>
-        /// Bước 17: Tải file thông báo dựa vào API /tthc/tchs/downloadthongbao
+        /// Xử lý tải chi tiết, file tờ khai và danh sách thông báo cho 1 hồ sơ.
+        /// Có retry riêng cho từng bước; nếu phiên hết hạn (token/session) sẽ re-login và thử lại.
+        /// Mọi lỗi được đánh dấu lên iTaxDec (HasDownloadError/DownloadErrorMsg) thay vì bỏ qua im lặng.
         /// </summary>
-        private async Task Step17_DownloadNotificationFile(TaxDeclarationSubmitted iTaxDec, TaxDecNotification iTaxDecNoti)
+        private async Task ProcessTransactionFile(TaxDeclarationSubmitted iTaxDec)
+        {
+            try
+            {
+                LogUtil.LogTrace($"PublicServiceCrawler.ProcessTransactionFile.Start, maHoSo: {iTaxDec.TransactionID}");
+                string folderPath = $"{FileUtil.BASE_PATH}/OutputFiles/{_profileID}/{_customerID}/{iTaxDec.TransactionID}";
+                Directory.CreateDirectory(folderPath);
+
+                HtmlDocument detailDoc = null;
+                await CommonPattern.Retry(async () =>
+                {
+                    detailDoc = await Step13_GetDetailPage(iTaxDec.TransactionID);
+                    await Task.Delay(300, _stoppingToken);
+                }, 3, 1000);
+
+                bool declOk = false;
+                await CommonPattern.Retry(async () =>
+                {
+                    declOk = await Step13_DownloadTransactionFile(iTaxDec);
+                    if (!declOk)
+                    {
+                        // Làm mới CSRF token (lấy lại trang chi tiết) trước khi thử lại, phòng phiên hết hạn
+                        try
+                        {
+                            detailDoc = await Step13_GetDetailPage(iTaxDec.TransactionID);
+                        }
+                        catch { }
+                        throw new Exception("Download declaration file failed");
+                    }
+                    await Task.Delay(300, _stoppingToken);
+                }, 3, 1000);
+                if (!declOk)
+                {
+                    iTaxDec.HasDownloadError = true;
+                    iTaxDec.DownloadErrorMsg = "Tải file tờ khai thất bại sau nhiều lần thử";
+                    LogUtil.LogError($"PublicServiceCrawler.ProcessTransactionFile.DownloadFail, maHoSo: {iTaxDec.TransactionID}");
+                }
+
+                await Step14_GetThongBaoPageData(iTaxDec, detailDoc);
+                await Task.Delay(300, _stoppingToken);
+
+                LogUtil.LogTrace($"PublicServiceCrawler.ProcessTransactionFile.End, maHoSo: {iTaxDec.TransactionID}");
+            }
+            catch (Exception ex)
+            {
+                iTaxDec.HasDownloadError = true;
+                iTaxDec.DownloadErrorMsg = ex.Message;
+                LogUtil.LogError(ex, $"PublicServiceCrawler.ProcessTransactionFile.Failed, maHoSo: {iTaxDec.TransactionID}");
+            }
+        }
+
+        /// <summary>
+        /// Bước 17: Tải file thông báo dựa vào API /tthc/tchs/downloadthongbao
+        /// File thông báo luôn là dạng .xml, ghi trực tiếp và parse nội dung XML.
+        /// Trả về true nếu tải và lưu file thông báo thành công.
+        /// </summary>
+        private async Task<bool> Step17_DownloadNotificationFile(TaxDeclarationSubmitted iTaxDec, TaxDecNotification iTaxDecNoti, string csrfToken = null)
         {
             HttpResponseMessage responseMessage = null;
+            var token = string.IsNullOrEmpty(csrfToken) ? _csrfToken : csrfToken;
+            bool saved = false;
             try
             {
                 LogUtil.LogTrace($"PublicServiceCrawler.Step17_DownloadNotificationFile.Start, idTbao: {iTaxDecNoti.NotificationID}");
-                string folderPath = $"{FileUtil.BASE_PATH}/OutputFiles/{_profileID}/{_customerID}/{iTaxDec.TransactionID}";
-                Directory.CreateDirectory(folderPath);
+                string transactionFolder = $"{FileUtil.BASE_PATH}/OutputFiles/{_profileID}/{_customerID}/{iTaxDec.TransactionID}";
+                string notificationsFolder = Path.Combine(transactionFolder, "Notifications");
+                Directory.CreateDirectory(notificationsFolder);
 
                 var payload = JsonConvert.SerializeObject(new
                 {
@@ -965,11 +1075,10 @@ namespace MISA.ASP.ClientApp.BL
                 {
                     Content = new StringContent(payload, Encoding.UTF8, "application/json")
                 };
-
                 request.Headers.Add("Referer", $"{PUBLIC_SERVICE_URL}/tthc/tchs/files/detail/{iTaxDec.TransactionID}?loai=");
-                if (!string.IsNullOrEmpty(_csrfToken))
+                if (!string.IsNullOrEmpty(token))
                 {
-                    request.Headers.Add("X-XSRF-TOKEN", _csrfToken);
+                    request.Headers.Add("X-XSRF-TOKEN", token);
                 }
 
                 responseMessage = await _client.SendAsync(request, _stoppingToken);
@@ -990,56 +1099,29 @@ namespace MISA.ASP.ClientApp.BL
                         fileName = $"Thong bao_{iTaxDecNoti.NotificationID}.xml";
                     }
 
-                    iTaxDecNoti.FileName = fileName;
-                    string filePath = Path.Combine(folderPath, fileName);
+                    if (string.IsNullOrEmpty(iTaxDecNoti.FileName))
+                    {
+                        iTaxDecNoti.FileName = fileName;
+                    }
+
+                    string filePath = Path.Combine(notificationsFolder, fileName);
                     File.WriteAllBytes(filePath, fileBytes);
                     LogUtil.LogTrace($"PublicServiceCrawler.Step17_DownloadNotificationFile.SaveFile: {filePath}");
-
-                    if (Path.GetExtension(fileName).Equals(".zip", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try
-                        {
-                            using (var stream = new MemoryStream(fileBytes))
-                            using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
-                            {
-                                foreach (var entry in archive.Entries)
-                                {
-                                    if (string.IsNullOrEmpty(entry.Name)) continue;
-                                    string destinationPath = Path.Combine(folderPath, entry.FullName);
-                                    string dirPath = Path.GetDirectoryName(destinationPath);
-                                    if (!string.IsNullOrEmpty(dirPath) && !Directory.Exists(dirPath))
-                                    {
-                                        Directory.CreateDirectory(dirPath);
-                                    }
-                                    using (var entryStream = entry.Open())
-                                    using (var fileStream = File.Create(destinationPath))
-                                    {
-                                        entryStream.CopyTo(fileStream);
-                                    }
-
-                                    if (Path.GetExtension(entry.Name).Equals(".xml", StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        ParseNotificationXml(destinationPath, iTaxDecNoti);
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception exZip)
-                        {
-                            LogUtil.LogError(exZip);
-                        }
-                    }
-                    else if (Path.GetExtension(fileName).Equals(".xml", StringComparison.OrdinalIgnoreCase))
-                    {
-                        ParseNotificationXml(filePath, iTaxDecNoti);
-                    }
+                    ParseNotificationXml(filePath, iTaxDecNoti);
+                    saved = true;
+                }
+                else
+                {
+                    LogUtil.LogError($"PublicServiceCrawler.Step17_DownloadNotificationFile.EmptyContent, idTbao: {iTaxDecNoti.NotificationID}");
                 }
 
                 LogUtil.LogTrace("PublicServiceCrawler.Step17_DownloadNotificationFile.End");
+                return saved;
             }
             catch (Exception ex)
             {
                 LogUtil.LogError(ex, responseMessage);
+                return false;
             }
         }
 
@@ -1088,7 +1170,7 @@ namespace MISA.ASP.ClientApp.BL
             await CommonPattern.Retry(async () =>
             {
                 await SignIn();
-            });
+            }, 5);
         }
 
         /// <summary>
@@ -1111,7 +1193,7 @@ namespace MISA.ASP.ClientApp.BL
                 await Task.Delay(500, _stoppingToken);
 
                 result = await Step11_ExtractTaxDecSubmitted(docResult, fromDate, toDate, captchaResult);
-            });
+            }, 5);
 
             return result ?? new List<TaxDeclarationSubmitted>();
         }
