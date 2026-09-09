@@ -135,8 +135,53 @@ namespace MISA.ASP.ClientApp.BL
         /// <summary>
         /// Bước 3: Lấy captcha từ endpoint chỉ định (mặc định /tthc/login/getCaptcha) và giải mã qua mô hình Python
         /// </summary>
+        //private async Task<CaptchaResult> Step3_ResolveCaptcha(string captchaUrl = "/tthc/login/getCaptcha")
+        //{
+        //    HttpResponseMessage responseMessage = null;
+        //    var captchaResult = new CaptchaResult();
+
+        //    try
+        //    {
+        //        LogUtil.LogTrace($"PublicServiceCrawler.Step3_ResolveCaptcha.Start, url: {captchaUrl}");
+        //        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        //        string separator = captchaUrl.Contains("?") ? "&" : "?";
+        //        var requestUrl = $"{captchaUrl}{separator}{timestamp}";
+
+        //        var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
+        //        string refererUrl = captchaUrl.Contains("/login") ? $"{PUBLIC_SERVICE_URL}/tthc/login" : $"{PUBLIC_SERVICE_URL}/tthc/tchs";
+        //        request.Headers.Add("Referer", refererUrl);
+        //        request.Headers.Add("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8");
+
+        //        responseMessage = await _client.SendAsync(request, _stoppingToken);
+        //        responseMessage.EnsureSuccessStatusCode();
+
+        //        var imageBytes = await responseMessage.Content.ReadAsByteArrayAsync();
+
+        //        // Giải mã captcha bằng mô hình cục bộ D:\Project\GetCaptcha\main.py
+        //        var captchaText = await ResolveCaptchaWithPython(imageBytes);
+
+        //        if (string.IsNullOrWhiteSpace(captchaText))
+        //        {
+        //            throw new UnResolvedCaptchaException();
+        //        }
+
+        //        captchaResult.ByteArray = imageBytes;
+        //        captchaResult.Result = captchaText;
+        //        LogUtil.LogTrace($"PublicServiceCrawler.Step3_ResolveCaptcha.Captcha: {captchaText}");
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        LogUtil.LogError(ex, responseMessage);
+        //        throw;
+        //    }
+
+        //    return captchaResult;
+        //}
+
         private async Task<CaptchaResult> Step3_ResolveCaptcha(string captchaUrl = "/tthc/login/getCaptcha")
         {
+            var captcha = string.Empty;
             HttpResponseMessage responseMessage = null;
             var captchaResult = new CaptchaResult();
 
@@ -158,17 +203,28 @@ namespace MISA.ASP.ClientApp.BL
 
                 var imageBytes = await responseMessage.Content.ReadAsByteArrayAsync();
 
-                // Giải mã captcha bằng mô hình cục bộ D:\Project\GetCaptcha\main.py
-                var captchaText = await ResolveCaptchaWithPython(imageBytes);
+                responseMessage.EnsureSuccessStatusCode();
+                var captchaResolver = new MisaCaptchaClient();
+                var stream = await responseMessage.Content.ReadAsStreamAsync();
+                captcha = await captchaResolver.Decaptcha(new CaptchaRequest
+                {
+                    Stream = stream,
+                    Source = "dichvucong",
+                },
+                refererUrl);
+                if (String.IsNullOrWhiteSpace(captcha))
+                {
+                    throw new UnResolvedCaptchaException();
+                }
+                captchaResult.ByteArray = FileUtil.ConvertStreamToByteArray(stream);
+                captchaResult.Result = captcha;
 
-                if (string.IsNullOrWhiteSpace(captchaText))
+                if (string.IsNullOrWhiteSpace(captcha))
                 {
                     throw new UnResolvedCaptchaException();
                 }
 
-                captchaResult.ByteArray = imageBytes;
-                captchaResult.Result = captchaText;
-                LogUtil.LogTrace($"PublicServiceCrawler.Step3_ResolveCaptcha.Captcha: {captchaText}");
+                LogUtil.LogTrace($"PublicServiceCrawler.Step3_ResolveCaptcha.Captcha: {captcha}");
             }
             catch (Exception ex)
             {
